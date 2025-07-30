@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# Logs & tmp
+dv_transcode_errors_*.log
+dv_failed_files_*.txt
+dv_success_files_*.txt
+
+# Editors
+*.swp
+*.swo
+.idea/
+.vscode/
