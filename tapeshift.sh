@@ -3,6 +3,7 @@
 set -e
 
 # === DEFAULT CONFIGURATION ===
+APP_NAME="TapeShift"
 TIMEOUT_DURATION=3600         # default: 1 hour
 DRY_RUN=false
 OVERWRITE=false
@@ -14,9 +15,9 @@ FFMPEG_THREADS=2              # threads per ffmpeg job (auto-tuned if --jobs giv
 CLEAN_TMP_ON_FAIL=false       # by default, keep tmp files on failure for inspection
 TIMESTAMP="$(date +%Y-%m-%d_%H-%M-%S)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOG_FILE="$SCRIPT_DIR/dv_transcode_errors_$TIMESTAMP.log"
-FAILED_LIST="$SCRIPT_DIR/dv_failed_files_$TIMESTAMP.txt"
-SUCCESS_LIST="$SCRIPT_DIR/dv_success_files_$TIMESTAMP.txt"
+LOG_FILE="$SCRIPT_DIR/tapeshift_errors_$TIMESTAMP.log"
+FAILED_LIST="$SCRIPT_DIR/tapeshift_failed_files_$TIMESTAMP.txt"
+SUCCESS_LIST="$SCRIPT_DIR/tapeshift_success_files_$TIMESTAMP.txt"
 JOBS_COUNTED=0
 
 # === CLEAN EXIT ON CTRL+C ===
@@ -50,6 +51,8 @@ wait_for_slot() {
 print_help() {
   cat <<EOF
 Usage: $(basename "$0") [options]
+
+TapeShift – DV/MiniDV batch transcoder for macOS
 
 Options:
   --dry-run                 Show what would run without encoding
