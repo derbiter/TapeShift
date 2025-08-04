@@ -4,6 +4,7 @@ set -e
 
 # === DEFAULT CONFIGURATION ===
 APP_NAME="TapeShift"
+VERSION="v1.3.1"
 TIMEOUT_DURATION=3600         # default: 1 hour
 DRY_RUN=false
 OVERWRITE=false
@@ -13,6 +14,7 @@ MAX_DURATION="00:19:45"       # hard limit for FAT32 split files
 CPU_LIMIT="$(sysctl -n hw.logicalcpu)"   # default parallel slots = logical cores
 FFMPEG_THREADS=2              # threads per ffmpeg job (auto-tuned if --jobs given)
 CLEAN_TMP_ON_FAIL=false       # by default, keep tmp files on failure for inspection
+COLOR_PROFILE=""              # minidv | hi8 | pal (if empty, prompt user)
 TIMESTAMP="$(date +%Y-%m-%d_%H-%M-%S)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="$SCRIPT_DIR/tapeshift_errors_$TIMESTAMP.log"
@@ -50,19 +52,21 @@ wait_for_slot() {
 # === HELP ===
 print_help() {
   cat <<EOF
+$APP_NAME $VERSION
 Usage: $(basename "$0") [options]
 
-TapeShift – DV/MiniDV batch transcoder for macOS
+TapeShift – DV/MiniDV/Hi8 batch transcoder for macOS
 
 Options:
-  --dry-run                 Show what would run without encoding
-  --overwrite               Replace existing outputs
-  --retry FILE              Retry only files listed in FILE
-  --timeout SECONDS         Max seconds per ffmpeg invocation (default: ${TIMEOUT_DURATION})
-  --jobs N                  Max parallel jobs (default: logical CPU count)
-  --threads N               Threads per ffmpeg job (default: ${FFMPEG_THREADS})
-  --clean-tmp-on-fail       Remove .mov.tmp on failures (safe, guarded to PRORES/PROXIES only)
-  -h | --help               Show this help
+  --dry-run                   Show what would run without encoding
+  --overwrite                 Replace existing outputs
+  --retry FILE                Retry only files listed in FILE
+  --timeout SECONDS           Max seconds per ffmpeg invocation (default: ${TIMEOUT_DURATION})
+  --jobs N                    Max parallel jobs (default: logical CPU count)
+  --threads N                 Threads per ffmpeg job (default: ${FFMPEG_THREADS})
+  --clean-tmp-on-fail         Remove .mov.tmp on failures (safe, guarded to PRORES/PROXIES only)
+  --color-profile PROFILE     One of: minidv | hi8 | pal (skips prompt)
+  -h | --help                 Show this help
 EOF
 }
 
@@ -76,6 +80,7 @@ while [[ $# -gt 0 ]]; do
     --jobs) CPU_LIMIT="$2"; shift ;;
     --threads) FFMPEG_THREADS="$2"; shift ;;
     --clean-tmp-on-fail) CLEAN_TMP_ON_FAIL=true ;;
+    --color-profile) COLOR_PROFILE="$2"; shift ;;
     -h|--help) print_help; exit 0 ;;
     *) echo "Unknown option: $1"; print_help; exit 1 ;;
   esac
@@ -135,6 +140,56 @@ fi
 echo "📂 Found ${#VIDEO_FILES[@]} files to process."
 echo ""
 
+# === FOOTAGE FORMAT PROMPT (unless provided via --color-profile) ===
+select_color_profile() {
+  case "$1" in
+    minidv|MINIDV|ntsc-dv|ntsc|dv)
+      COLOR_PROFILE="minidv"
+      ;;
+    hi8|HI8|ntsc-hi8|hi-8)
+      COLOR_PROFILE="hi8"
+      ;;
+    pal|PAL)
+      COLOR_PROFILE="pal"
+      ;;
+    *)
+      COLOR_PROFILE=""
+      ;;
+  esac
+
+  if [[ -z "$COLOR_PROFILE" ]]; then
+    echo "Select source tape format for color metadata:"
+    echo "  1) MiniDV (NTSC)"
+    echo "  2) Hi8 (NTSC)"
+    echo "  3) PAL (DV/Hi8)"
+    read -rp "Enter choice [1-3]: " choice
+    case "$choice" in
+      1) COLOR_PROFILE="minidv" ;;
+      2) COLOR_PROFILE="hi8" ;;
+      3) COLOR_PROFILE="pal" ;;
+      *) echo "Invalid choice. Defaulting to MiniDV (NTSC)."; COLOR_PROFILE="minidv" ;;
+    esac
+  fi
+
+  # Map to encoder-safe color args
+  case "$COLOR_PROFILE" in
+    minidv|hi8)
+      COLOR_ARGS=(-movflags +use_metadata_tags+write_colr -colorspace smpte170m -color_primaries smpte170m -color_trc smpte170m)
+      COLOR_ARGS_FALLBACK=("${COLOR_ARGS[@]}")  # same
+      HUMAN_COLOR="NTSC (smpte170m)"
+      ;;
+    pal)
+      COLOR_ARGS=(-movflags +use_metadata_tags+write_colr -colorspace bt470bg -color_primaries bt470bg -color_trc bt470bg)
+      COLOR_ARGS_FALLBACK=(-movflags +use_metadata_tags+write_colr -colorspace smpte170m -color_primaries smpte170m -color_trc smpte170m)
+      HUMAN_COLOR="PAL (bt470bg, fallback smpte170m)"
+      ;;
+  esac
+
+  echo "🎚  Color profile: $COLOR_PROFILE → $HUMAN_COLOR"
+}
+
+select_color_profile "$COLOR_PROFILE"
+
 # === TRANSCODING FUNCTION ===
 transcode_file() {
   local f="$1"
@@ -165,33 +220,69 @@ transcode_file() {
 
   # Common mapping & metadata
   MAP_ARGS=(-map 0:v:0 -map 0:a:? -map_metadata 0)
-  # SD NTSC 601 color metadata
-  COLOR_ARGS=(-movflags +use_metadata_tags+write_colr -colorspace smpte170m -color_primaries smpte170m -color_trc bt470bg)
+
+  # Helper: run ffmpeg once with COLOR_ARGS, and if it fails (non-timeout) and a fallback exists, try fallback
+  run_ffmpeg_with_color() {
+    # $1 = 'prores' or 'proxy'
+    # $2 = input file
+    # $3 = output tmp path
+    # $4 = vf string
+    # $5 = prores profile (e.g., 3 or 0)
+    local label="$1"
+    local in="$2"
+    local outtmp="$3"
+    local vf="$4"
+    local prof="$5"
+
+    timeout "$TIMEOUT_DURATION" ffmpeg -hide_banner -loglevel error -y \
+      -threads "$FFMPEG_THREADS" \
+      -i "$in" \
+      -t "$MAX_DURATION" \
+      -vf "$vf" \
+      "${MAP_ARGS[@]}" \
+      -c:v prores_ks -profile:v "$prof" \
+      -c:a pcm_s16le \
+      "${COLOR_ARGS[@]}" \
+      -f mov "$outtmp"
+    local rc=$?
+
+    if [[ $rc -eq 124 ]]; then
+      echo "❌ Timeout after $TIMEOUT_DURATION sec ($label): $in" | tee -a "$FAILED_LIST"
+      [[ "$CLEAN_TMP_ON_FAIL" = true ]] && safe_rm_tmp "$outtmp"
+      return $rc
+    elif [[ $rc -ne 0 ]]; then
+      # Try fallback if different from primary
+      if [[ "${COLOR_ARGS_FALLBACK[*]}" != "${COLOR_ARGS[*]}" ]]; then
+        echo "↩️  Retrying $label with fallback color tags..." | tee -a "$LOG_FILE"
+        timeout "$TIMEOUT_DURATION" ffmpeg -hide_banner -loglevel error -y \
+          -threads "$FFMPEG_THREADS" \
+          -i "$in" \
+          -t "$MAX_DURATION" \
+          -vf "$vf" \
+          "${MAP_ARGS[@]}" \
+          -c:v prores_ks -profile:v "$prof" \
+          -c:a pcm_s16le \
+          "${COLOR_ARGS_FALLBACK[@]}" \
+          -f mov "$outtmp"
+        rc=$?
+      fi
+    fi
+
+    return $rc
+  }
 
   # === ProRes Output ===
   if [[ ! -f "$output_prores" || "$OVERWRITE" = true ]]; then
-    timeout "$TIMEOUT_DURATION" ffmpeg -hide_banner -loglevel error -y \
-      -threads "$FFMPEG_THREADS" \
-      -i "$f" \
-      -t "$MAX_DURATION" \
-      -vf "yadif=mode=0:parity=auto:deint=all" \
-      "${MAP_ARGS[@]}" \
-      -c:v prores_ks -profile:v 3 \
-      -c:a pcm_s16le \
-      "${COLOR_ARGS[@]}" \
-      -f mov "${output_prores}.tmp"
+    run_ffmpeg_with_color "ProRes" "$f" "${output_prores}.tmp" "yadif=mode=0:parity=auto:deint=all" 3
     result=$?
 
     if [[ $result -eq 124 ]]; then
-      echo "❌ Timeout after $TIMEOUT_DURATION sec (ProRes): $f" | tee -a "$FAILED_LIST"
-      [[ "$CLEAN_TMP_ON_FAIL" = true ]] && safe_rm_tmp "${output_prores}.tmp"
       return
     elif [[ $result -ne 0 ]]; then
       echo "❌ ProRes failed: $f" | tee -a "$FAILED_LIST"
       [[ "$CLEAN_TMP_ON_FAIL" = true ]] && safe_rm_tmp "${output_prores}.tmp"
       return
     else
-      # Safe move into place
       if [[ -d "$output_prores" ]]; then
         echo "❌ Expected file but found directory at $output_prores — skipping." | tee -a "$FAILED_LIST"
         [[ "$CLEAN_TMP_ON_FAIL" = true ]] && safe_rm_tmp "${output_prores}.tmp"
@@ -207,28 +298,16 @@ transcode_file() {
 
   # === Proxy Output ===
   if [[ ! -f "$output_proxy" || "$OVERWRITE" = true ]]; then
-    timeout "$TIMEOUT_DURATION" ffmpeg -hide_banner -loglevel error -y \
-      -threads "$FFMPEG_THREADS" \
-      -i "$f" \
-      -t "$MAX_DURATION" \
-      -vf "yadif=mode=0:parity=auto:deint=all,scale=640:-2" \
-      "${MAP_ARGS[@]}" \
-      -c:v prores_ks -profile:v 0 \
-      -c:a pcm_s16le \
-      "${COLOR_ARGS[@]}" \
-      -f mov "${output_proxy}.tmp"
+    run_ffmpeg_with_color "Proxy" "$f" "${output_proxy}.tmp" "yadif=mode=0:parity=auto:deint=all,scale=640:-2" 0
     result=$?
 
     if [[ $result -eq 124 ]]; then
-      echo "❌ Timeout after $TIMEOUT_DURATION sec (Proxy): $f" | tee -a "$FAILED_LIST"
-      [[ "$CLEAN_TMP_ON_FAIL" = true ]] && safe_rm_tmp "${output_proxy}.tmp"
       return
     elif [[ $result -ne 0 ]]; then
       echo "❌ Proxy failed: $f" | tee -a "$FAILED_LIST"
       [[ "$CLEAN_TMP_ON_FAIL" = true ]] && safe_rm_tmp "${output_proxy}.tmp"
       return
     else
-      # Safe move into place
       if [[ -d "$output_proxy" ]]; then
         echo "❌ Expected file but found directory at $output_proxy — skipping." | tee -a "$FAILED_LIST"
         [[ "$CLEAN_TMP_ON_FAIL" = true ]] && safe_rm_tmp "${output_proxy}.tmp"
