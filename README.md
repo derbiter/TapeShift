@@ -1,5 +1,7 @@
 # TapeShift v1.3.1
 
+Fast, safe MiniDV/Hi8 → ProRes transcoding for macOS.
+
 TapeShift is a high‑performance Bash script for DV/MiniDV/Hi8 transcoding on macOS (tested on 15.5). It recursively scans for `.dv`/`.avi` and creates **ProRes masters** and **ProRes proxies** per source folder (`PRORES/`, `PROXIES/`).
 
 ## What’s new in v1.3.1
@@ -27,3 +29,27 @@ chmod +x tapeshift.sh
 ## Requirements
 - macOS 15.5+
 - FFmpeg (with prores_ks), e.g. `brew install ffmpeg`
+
+## Example Folder Structure
+Before:
+```
+Footage/Scene1/file1.dv
+Footage/Scene2/file2.avi
+```
+
+After:
+```
+Footage/Scene1/PRORES/file1.mov
+Footage/Scene1/PROXIES/file1_proxy.mov
+Footage/Scene2/PRORES/file2.mov
+Footage/Scene2/PROXIES/file2_proxy.mov
+```
+
+## Safety Notes
+- TapeShift never overwrites source files.
+- Always test with `--dry-run` first to preview actions.
+- The `--overwrite` flag replaces existing transcodes.
+- Temporary files are guarded and will only be deleted safely within `PRORES/` or `PROXIES/`.
+
+## License
+This project is licensed under the MIT License – see the [LICENSE](LICENSE) file for details.
